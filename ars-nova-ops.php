@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Ars Nova Ops (Plugin Installer)
  * Description: Admin-only REST endpoints that let the Ars Nova WordPress MCP connector INSTALL, UPDATE, ACTIVATE, DEACTIVATE and DELETE plugins by command. Wraps WordPress core's own Plugin_Upgrader. Accepts a WordPress.org slug, a zip URL (allow-listed hosts), or a base64 zip. Production installs require an explicit confirmation flag. DEV automation helper.
- * Version: 1.0.0
+ * Version: 1.1.0
  * Author: Ars Nova (Jonathan Raabe) + Claude
  * Requires at least: 5.8
  * Requires PHP: 7.4
@@ -10,7 +10,7 @@
 
 if ( ! defined( 'ABSPATH' ) ) { exit; }
 
-define( 'ANS_OPS_VERSION', '1.0.0' );
+define( 'ANS_OPS_VERSION', '1.1.0' );
 define( 'ANS_OPS_NS', 'ans-ops/v1' );
 
 /* ---------------------------------------------------------------------------
@@ -175,12 +175,21 @@ add_action( 'rest_api_init', function () {
 		'callback'            => 'ans_ops_route_delete',
 	) );
 
+	// Delete an orphan directory left behind by a failed install.
+	register_rest_route( ANS_OPS_NS, '/plugin/delete-dir', array(
+		'methods'             => 'POST',
+		'permission_callback' => 'ans_ops_can_delete',
+		'callback'            => 'ans_ops_route_delete_dir',
+	) );
+
 	// List (convenience).
 	register_rest_route( ANS_OPS_NS, '/plugin/list', array(
 		'methods'             => 'GET',
 		'permission_callback' => 'ans_ops_can_install',
 		'callback'            => function () {
 			if ( ! function_exists( 'get_plugins' ) ) { require_once ABSPATH . 'wp-admin/includes/plugin.php'; }
+			// Never serve a cached scan — a delete in a prior request must show here.
+			wp_cache_delete( 'plugins', 'plugins' );
 			$out = array();
 			foreach ( get_plugins() as $basename => $data ) {
 				$out[] = array(
@@ -317,6 +326,49 @@ function ans_ops_route_status( WP_REST_Request $req ) {
 	return array( 'ok' => true, 'plugin' => $plugin, 'active' => is_plugin_active( $plugin ) );
 }
 
+/**
+ * Resolve a path under wp-content/plugins and refuse anything that escapes it.
+ *
+ * Returns an absolute, normalised path, or WP_Error. Guards against traversal
+ * ("../"), absolute paths, and the plugins directory itself — deleting
+ * WP_PLUGIN_DIR would take the whole site's plugins with it.
+ */
+function ans_ops_safe_plugin_path( $relative ) {
+	$relative = str_replace( '\\', '/', trim( (string) $relative ) );
+	$relative = ltrim( $relative, '/' );
+	if ( '' === $relative || false !== strpos( $relative, '../' ) || false !== strpos( $relative, './' ) ) {
+		return new WP_Error( 'ans_ops_bad_path', 'Refusing a path that is empty or contains relative segments.', array( 'status' => 400 ) );
+	}
+	$root = wp_normalize_path( trailingslashit( WP_PLUGIN_DIR ) );
+	$abs  = wp_normalize_path( $root . $relative );
+	if ( 0 !== strpos( $abs, $root ) || untrailingslashit( $abs ) === untrailingslashit( $root ) ) {
+		return new WP_Error( 'ans_ops_bad_path', 'Refusing a path outside wp-content/plugins.', array( 'status' => 400 ) );
+	}
+	return $abs;
+}
+
+/** Recursively remove a directory under wp-content/plugins. Returns bool. */
+function ans_ops_rmdir( $abs_dir ) {
+	global $wp_filesystem;
+	if ( $wp_filesystem && $wp_filesystem->is_dir( $abs_dir ) ) {
+		if ( $wp_filesystem->delete( trailingslashit( $abs_dir ), true ) ) {
+			return true;
+		}
+	}
+	// Fallback: plain PHP recursion, for hosts where WP_Filesystem's delete is unreliable.
+	if ( ! is_dir( $abs_dir ) ) { return ! file_exists( $abs_dir ); }
+	$items = new RecursiveIteratorIterator(
+		new RecursiveDirectoryIterator( $abs_dir, FilesystemIterator::SKIP_DOTS ),
+		RecursiveIteratorIterator::CHILD_FIRST
+	);
+	foreach ( $items as $item ) {
+		if ( $item->isDir() ) { @rmdir( $item->getPathname() ); } else { @unlink( $item->getPathname() ); }
+	}
+	@rmdir( $abs_dir );
+	clearstatcache( true, $abs_dir );
+	return ! file_exists( $abs_dir );
+}
+
 function ans_ops_route_delete( WP_REST_Request $req ) {
 	$plugin = trim( (string) $req->get_param( 'plugin' ) );
 	if ( '' === $plugin ) {
@@ -336,9 +388,87 @@ function ans_ops_route_delete( WP_REST_Request $req ) {
 	if ( ! WP_Filesystem() ) {
 		return new WP_Error( 'ans_ops_fs', 'Could not initialize filesystem for delete.', array( 'status' => 500 ) );
 	}
+
+	// Work out what SHOULD disappear, so we can verify rather than assume.
+	$target = ( false !== strpos( $plugin, '/' ) ) ? dirname( $plugin ) : $plugin;
+	$abs    = ans_ops_safe_plugin_path( $target );
+	if ( is_wp_error( $abs ) ) { return $abs; }
+
 	$res = delete_plugins( array( $plugin ) );
 	if ( is_wp_error( $res ) ) {
 		return new WP_Error( 'ans_ops_delete', $res->get_error_message(), array( 'status' => 500 ) );
 	}
-	return array( 'ok' => true, 'deleted' => $plugin );
+	// NOTE: delete_plugins() returns TRUE on success, FALSE on an empty list and
+	// NULL when it wants filesystem credentials. Only WP_Error was checked before
+	// 1.1.0, so a NULL/FALSE no-op was reported to the caller as a success.
+	$method = 'delete_plugins';
+	clearstatcache( true, $abs );
+	if ( file_exists( $abs ) ) {
+		$method = 'recursive_rmdir';
+		ans_ops_rmdir( $abs );
+		clearstatcache( true, $abs );
+	}
+	$gone = ! file_exists( $abs );
+
+	// Drop the cached plugin scan so plugin/list reflects reality immediately.
+	wp_cache_delete( 'plugins', 'plugins' );
+
+	if ( ! $gone ) {
+		return new WP_Error(
+			'ans_ops_delete_unverified',
+			'Delete reported no error but "' . $target . '" is still on disk. Check file permissions.',
+			array( 'status' => 500, 'path' => $abs )
+		);
+	}
+	return array(
+		'ok'       => true,
+		'deleted'  => $plugin,
+		'removed'  => $target,
+		'verified' => true,
+		'method'   => $method,
+	);
+}
+
+/**
+ * Delete an orphan directory under wp-content/plugins by folder name.
+ *
+ * For leftovers from a failed install that no longer present a valid plugin
+ * basename, so plugin/delete cannot address them.
+ */
+function ans_ops_route_delete_dir( WP_REST_Request $req ) {
+	$dir = trim( (string) $req->get_param( 'dir' ) );
+	if ( '' === $dir ) {
+		return new WP_Error( 'ans_ops_no_dir', 'Provide the folder name relative to wp-content/plugins.', array( 'status' => 400 ) );
+	}
+	if ( ans_ops_is_production() && ! filter_var( $req->get_param( 'confirm_production' ), FILTER_VALIDATE_BOOLEAN ) ) {
+		return new WP_Error( 'ans_ops_production_blocked', 'Production site: resend with confirm_production=true to delete.', array( 'status' => 403 ) );
+	}
+	require_once ABSPATH . 'wp-admin/includes/file.php';
+	require_once ABSPATH . 'wp-admin/includes/plugin.php';
+
+	$abs = ans_ops_safe_plugin_path( $dir );
+	if ( is_wp_error( $abs ) ) { return $abs; }
+	if ( ! file_exists( $abs ) ) {
+		return new WP_Error( 'ans_ops_not_found', 'No such folder: ' . $dir, array( 'status' => 404 ) );
+	}
+
+	// Never remove a directory that holds an ACTIVE plugin.
+	foreach ( (array) get_option( 'active_plugins', array() ) as $active ) {
+		$active_root = wp_normalize_path( trailingslashit( WP_PLUGIN_DIR ) . dirname( $active ) );
+		if ( 0 === strpos( trailingslashit( $active_root ), trailingslashit( $abs ) ) ) {
+			return new WP_Error( 'ans_ops_active', 'Refusing: "' . $dir . '" contains the active plugin "' . $active . '". Deactivate it first.', array( 'status' => 409 ) );
+		}
+	}
+
+	if ( ! WP_Filesystem() ) {
+		return new WP_Error( 'ans_ops_fs', 'Could not initialize filesystem for delete.', array( 'status' => 500 ) );
+	}
+	ans_ops_rmdir( $abs );
+	clearstatcache( true, $abs );
+	wp_cache_delete( 'plugins', 'plugins' );
+
+	if ( file_exists( $abs ) ) {
+		return new WP_Error( 'ans_ops_delete_unverified', 'Could not remove "' . $dir . '". Check file permissions.', array( 'status' => 500, 'path' => $abs ) );
+	}
+	return array( 'ok' => true, 'removed' => $dir, 'verified' => true );
 }
