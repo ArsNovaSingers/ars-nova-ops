@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Ars Nova Ops (Plugin Installer)
  * Description: Admin-only REST endpoints that let the Ars Nova WordPress MCP connector INSTALL, UPDATE, ACTIVATE, DEACTIVATE and DELETE plugins by command. Wraps WordPress core's own Plugin_Upgrader. Accepts a WordPress.org slug, a zip URL (allow-listed hosts), a base64 zip, or a Google Drive file ID fetched authenticated via ars-nova-google-connector. Also exposes the handful of core site options WordPress core REST omits. Production installs require an explicit confirmation flag.
- * Version: 1.2.0
+ * Version: 1.2.1
  * Author: Ars Nova (Jonathan Raabe) + Claude
  * Requires at least: 5.8
  * Requires PHP: 7.4
@@ -10,7 +10,7 @@
 
 if ( ! defined( 'ABSPATH' ) ) { exit; }
 
-define( 'ANS_OPS_VERSION', '1.2.0' );
+define( 'ANS_OPS_VERSION', '1.2.1' );
 define( 'ANS_OPS_NS', 'ans-ops/v1' );
 
 /* ---------------------------------------------------------------------------
@@ -374,14 +374,34 @@ function ans_ops_route_install( WP_REST_Request $req ) {
 		$package = $tmp_file;
 	}
 
-	$res = ans_ops_run_install( $package, ( '' !== $slug ) ? false : $overwrite );
+	// Honour $overwrite for EVERY source.
+	//
+	// Until 1.2.1 this line read:
+	//     ans_ops_run_install( $package, ( '' !== $slug ) ? false : $overwrite )
+	// which threw the caller's overwrite flag away whenever the source was a
+	// WordPress.org slug - including when /plugin/update had just set it to true.
+	// Consequence: a NEW slug install worked, and UPDATING any already-installed
+	// wordpress.org plugin (WooCommerce, Yoast, Kadence...) was impossible; it
+	// failed every time with "Destination folder already exists" surfaced as a
+	// bare HTTP 500. Installs from url/zip_b64/drive_file_id were unaffected,
+	// which is exactly why the failure read as intermittent rather than total.
+	$res = ans_ops_run_install( $package, $overwrite );
 
 	if ( $tmp_file && file_exists( $tmp_file ) ) { @unlink( $tmp_file ); }
 
 	if ( is_wp_error( $res ) ) {
 		$data = $res->get_error_data();
+		// Emit BOTH shapes. 'error'/'messages' is what this plugin has always
+		// returned; 'code'/'message' is the shape WordPress uses for a WP_Error,
+		// and it is the only shape the MCP connector's error mapper reads. Without
+		// it the connector reported a bare "HTTP 500" and discarded the reason the
+		// server had just spelled out - six installs were once diagnosed blind
+		// because of this. Cheap to send, and it makes the failure self-describing
+		// for any client.
 		return new WP_REST_Response( array(
 			'ok'       => false,
+			'code'     => $res->get_error_code(),
+			'message'  => $res->get_error_message(),
 			'error'    => $res->get_error_message(),
 			'messages' => is_array( $data ) && isset( $data['messages'] ) ? $data['messages'] : array(),
 		), 500 );
