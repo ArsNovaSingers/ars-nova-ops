@@ -2,7 +2,7 @@
 Author: Ars Nova (Jonathan Raabe) + Claude
 Requires at least: 5.8
 Requires PHP: 7.4
-Stable tag: 1.2.0
+Stable tag: 1.3.0
 
 Admin-only REST endpoints (namespace: ans-ops/v1) that let the Ars Nova
 WordPress MCP connector install / update / activate / deactivate / delete
@@ -46,6 +46,20 @@ Routes:
                                      | time_format | start_of_week | blog_public }
 
 == Changelog ==
+= 1.3.0 =
+* New read-only route GET /site/inspect - returns allow-listed plugin settings
+  that core REST does not expose (Tickera's tc_general_setting, the Tickera
+  Mailchimp add-on's settings, the WooCommerce email from/reply-to fields).
+  Pass ?name=<option> for one, or omit it for all.
+* The inspect allow-list is SEPARATE from the writable one used by
+  /site/options. That list is shared with the option writer, so anything added
+  there would become writable; inspect is read-only by construction.
+* Credential-looking values (key, secret, token, password, salt, auth, ...) are
+  replaced with ***redacted*** before the response leaves the site, at every
+  level of a nested settings array.
+* Recursion is depth-capped at 8 so a pathological settings blob cannot hang
+  the request.
+
 = 1.2.0 =
 * NEW source: drive_file_id — install a plugin zip straight from Google Drive,
   fetched authenticated via ars-nova-google-connector's service account. Added

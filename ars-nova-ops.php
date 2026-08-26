@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Ars Nova Ops (Plugin Installer)
  * Description: Admin-only REST endpoints that let the Ars Nova WordPress MCP connector INSTALL, UPDATE, ACTIVATE, DEACTIVATE and DELETE plugins by command. Wraps WordPress core's own Plugin_Upgrader. Accepts a WordPress.org slug, a zip URL (allow-listed hosts), a base64 zip, or a Google Drive file ID fetched authenticated via ars-nova-google-connector. Also exposes the handful of core site options WordPress core REST omits. Production installs require an explicit confirmation flag.
- * Version: 1.2.1
+ * Version: 1.3.0
  * Author: Ars Nova (Jonathan Raabe) + Claude
  * Requires at least: 5.8
  * Requires PHP: 7.4
@@ -10,7 +10,7 @@
 
 if ( ! defined( 'ABSPATH' ) ) { exit; }
 
-define( 'ANS_OPS_VERSION', '1.2.1' );
+define( 'ANS_OPS_VERSION', '1.3.0' );
 define( 'ANS_OPS_NS', 'ans-ops/v1' );
 
 /* ---------------------------------------------------------------------------
@@ -269,6 +269,22 @@ add_action( 'rest_api_init', function () {
 			'methods'             => 'POST',
 			'permission_callback' => 'ans_ops_can_manage_options',
 			'callback'            => 'ans_ops_route_set_options',
+		),
+	) );
+
+	// Read-only inspection of allow-listed plugin settings blobs. GET only, and
+	// credential-looking values are redacted. Separate allow-list from the
+	// writable one above on purpose - see ans_ops_inspectable_options().
+	register_rest_route( ANS_OPS_NS, '/site/inspect', array(
+		'methods'             => 'GET',
+		'permission_callback' => 'ans_ops_can_manage_options',
+		'callback'            => 'ans_ops_route_inspect_options',
+		'args'                => array(
+			'name' => array(
+				'type'              => 'string',
+				'required'          => false,
+				'sanitize_callback' => 'sanitize_text_field',
+			),
 		),
 	) );
 
@@ -700,4 +716,98 @@ function ans_ops_route_delete_dir( WP_REST_Request $req ) {
 		return new WP_Error( 'ans_ops_delete_unverified', 'Could not remove "' . $dir . '". Check file permissions.', array( 'status' => 500, 'path' => $abs ) );
 	}
 	return array( 'ok' => true, 'removed' => $dir, 'verified' => true );
+}
+
+/* ---------------------------------------------------------------------------
+ * Read-only settings inspection (added 1.3.0)
+ *
+ * DELIBERATELY SEPARATE from ans_ops_allowed_options(). That list is shared
+ * with the option WRITER, so anything added there becomes writable. This list
+ * is read-only and exists so the connector can inspect plugin settings that
+ * live in one serialized blob (Tickera, the Tickera Mailchimp add-on) and that
+ * core REST does not expose.
+ *
+ * Credential-looking values are redacted before they leave the site. This
+ * endpoint must never become a way to read secrets.
+ * ------------------------------------------------------------------------ */
+function ans_ops_inspectable_options() {
+	return apply_filters( 'ans_ops_inspectable_options', array(
+		'tc_general_setting',
+		'tc_general_settings',
+		'tc_mailchimp_settings',
+		'woocommerce_email_from_address',
+		'woocommerce_email_from_name',
+		'woocommerce_email_reply_to_enabled',
+		'woocommerce_email_reply_to_address',
+		'woocommerce_email_footer_text',
+		'woocommerce_store_address',
+		'admin_email',
+		'siteurl',
+		'home',
+	) );
+}
+
+/** Keys whose VALUE must never leave the site. Matched case-insensitively. */
+function ans_ops_secret_key_pattern() {
+	return '/(secret|password|passwd|\bpass\b|private|api[_-]?key|[_-]key$|^key$|token|salt|nonce|credential|auth)/i';
+}
+
+/**
+ * Recursively redact credential-looking values.
+ * Depth-capped so a deeply nested or self-referential array cannot hang PHP.
+ */
+function ans_ops_redact( $value, $depth = 0 ) {
+	if ( $depth > 8 ) { return '***depth-limit***'; }
+	if ( is_object( $value ) ) { $value = (array) $value; }
+	if ( ! is_array( $value ) ) { return $value; }
+
+	$out = array();
+	foreach ( $value as $k => $v ) {
+		if ( is_string( $k ) && preg_match( ans_ops_secret_key_pattern(), $k ) ) {
+			$out[ $k ] = ( '' === $v || null === $v ) ? '' : '***redacted***';
+			continue;
+		}
+		$out[ $k ] = ans_ops_redact( $v, $depth + 1 );
+	}
+	return $out;
+}
+
+function ans_ops_route_inspect_options( WP_REST_Request $req ) {
+	$allowed = ans_ops_inspectable_options();
+	$name    = trim( (string) $req->get_param( 'name' ) );
+
+	if ( '' !== $name ) {
+		if ( ! in_array( $name, $allowed, true ) ) {
+			return new WP_Error(
+				'ans_ops_option_not_inspectable',
+				'"' . sanitize_text_field( $name ) . '" is not on the inspect allow-list. Allowed: ' . implode( ', ', $allowed ),
+				array( 'status' => 400 )
+			);
+		}
+		$names = array( $name );
+	} else {
+		$names = $allowed;
+	}
+
+	$out = array();
+	foreach ( $names as $key ) {
+		$raw = get_option( $key, null );
+		if ( null === $raw ) {
+			$out[ $key ] = array( 'exists' => false );
+			continue;
+		}
+		// A top-level scalar whose own NAME looks like a secret is redacted too.
+		if ( ! is_array( $raw ) && ! is_object( $raw ) && preg_match( ans_ops_secret_key_pattern(), $key ) ) {
+			$out[ $key ] = array( 'exists' => true, 'value' => '***redacted***' );
+			continue;
+		}
+		$out[ $key ] = array( 'exists' => true, 'value' => ans_ops_redact( $raw ) );
+	}
+
+	return rest_ensure_response( array(
+		'ok'        => true,
+		'read_only' => true,
+		'count'     => count( $out ),
+		'options'   => $out,
+	) );
 }
