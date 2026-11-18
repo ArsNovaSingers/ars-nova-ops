@@ -2,7 +2,7 @@
 Author: Ars Nova (Jonathan Raabe) + Claude
 Requires at least: 5.8
 Requires PHP: 7.4
-Stable tag: 1.3.0
+Stable tag: 1.4.0
 
 Admin-only REST endpoints (namespace: ans-ops/v1) that let the Ars Nova
 WordPress MCP connector install / update / activate / deactivate / delete
@@ -44,8 +44,38 @@ Routes:
   GET  ans-ops/v1/site/options
   POST ans-ops/v1/site/options     { timezone_string | gmt_offset | date_format
                                      | time_format | start_of_week | blog_public }
+  POST ans-ops/v1/content/search   { q, post_types?, statuses?, case_sensitive?, limit? }
+  POST ans-ops/v1/content/replace  { id, edits:[{find, replace, expect_count?}],
+                                     fields?, regex?, dry_run?, confirm_production?,
+                                     expect_modified_gmt?, ignore_lock? }
+
+Content search / replace (1.4.0):
+  - Both work on RAW stored content (Gutenberg markup, block attributes, HTML),
+    which core search does not look at. Need edit_others_posts + edit_others_pages.
+  - search: case-insensitive by default; default types are every public type
+    plus wp_block and wp_template_part; default statuses publish, future,
+    draft, pending, private. Returns id/type/status/title, match_count and
+    ~80 characters of context around each match (match shown in [[...]]).
+  - replace: dry_run defaults to TRUE and returns per-edit counts, match
+    context and a line diff. Each edit must match exactly expect_count times
+    (default 1) or nothing is saved. Edits apply in order. Plain strings by
+    default; regex=true takes a full PCRE pattern with delimiters, with a
+    lowered backtrack limit. fields defaults to ["content"]; "excerpt" allowed.
+  - A real save: refused on LIVE without confirm_production=true; refused if
+    block comments would stop balancing; refused if the post is open in the
+    editor by someone else (ignore_lock=true overrides); refused if the user
+    lacks unfiltered_html (kses would strip SVG elsewhere on the page). It
+    snapshots the pre-edit state as a revision (undo_revision_id), saves via
+    wp_update_post(), then reads the content back and reports verified.
 
 == Changelog ==
+= 1.4.0 =
+* New POST /content/search - find text in RAW post/page content, including
+  block attributes and HTML that core search misses.
+* New POST /content/replace - change exactly the text named, with dry run by
+  default, exact match counts, block-balance check, undo revision and a
+  read-back check. Built so a one-line change no longer means retyping a whole
+  page through wp_update_page (INFRA-29).
 = 1.3.0 =
 * New read-only route GET /site/inspect - returns allow-listed plugin settings
   that core REST does not expose (Tickera's tc_general_setting, the Tickera

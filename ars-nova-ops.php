@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Ars Nova Ops (Plugin Installer)
  * Description: Admin-only REST endpoints that let the Ars Nova WordPress MCP connector INSTALL, UPDATE, ACTIVATE, DEACTIVATE and DELETE plugins by command. Wraps WordPress core's own Plugin_Upgrader. Accepts a WordPress.org slug, a zip URL (allow-listed hosts), a base64 zip, or a Google Drive file ID fetched authenticated via ars-nova-google-connector. Also exposes the handful of core site options WordPress core REST omits. Production installs require an explicit confirmation flag.
- * Version: 1.3.0
+ * Version: 1.4.0
  * Author: Ars Nova (Jonathan Raabe) + Claude
  * Requires at least: 5.8
  * Requires PHP: 7.4
@@ -10,7 +10,7 @@
 
 if ( ! defined( 'ABSPATH' ) ) { exit; }
 
-define( 'ANS_OPS_VERSION', '1.3.0' );
+define( 'ANS_OPS_VERSION', '1.4.0' );
 define( 'ANS_OPS_NS', 'ans-ops/v1' );
 
 /* ---------------------------------------------------------------------------
@@ -811,3 +811,6 @@ function ans_ops_route_inspect_options( WP_REST_Request $req ) {
 		'options'   => $out,
 	) );
 }
+
+/* Raw content search + find-and-replace (1.4.0, INFRA-29). */
+require_once __DIR__ . '/includes/content-edit.php';
